@@ -5,6 +5,7 @@
         "deque": "cpp",
         "cfloat": "cpp",
         "core": "cpp",
-        "numericaldiff": "cpp"
+        "numericaldiff": "cpp",
+        "ostream": "cpp"
     }
 }

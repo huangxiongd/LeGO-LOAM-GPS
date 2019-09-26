@@ -34,6 +34,7 @@
 #include "Eigen/Core"
 #include "Eigen/Geometry"
 #include "bdxt/rtk.h"
+#include <iostream>
 
 class TransformFusion{
 
@@ -44,6 +45,7 @@ private:
     ros::Publisher pubLaserOdometry2;
     ros::Subscriber subLaserOdometry;
     ros::Subscriber subOdomAftMapped;
+    ros::Subscriber subRTK;
 
     nav_msgs::Odometry laserOdometry2;
     tf::StampedTransform laserOdometryTrans2;
@@ -66,7 +68,7 @@ private:
     std_msgs::Header currentHeader;
 
     bool is_gps_init; 
-    Eigen::Isometry3d tBody2ENU;
+    Eigen::Isometry3d tBody_in_ENU;
 
 public:
 
@@ -75,6 +77,7 @@ public:
         pubLaserOdometry2 = nh.advertise<nav_msgs::Odometry> ("/integrated_to_init", 5);
         subLaserOdometry = nh.subscribe<nav_msgs::Odometry>("/laser_odom_to_init", 5, &TransformFusion::laserOdometryHandler, this);
         subOdomAftMapped = nh.subscribe<nav_msgs::Odometry>("/aft_mapped_to_init", 5, &TransformFusion::odomAftMappedHandler, this);
+        subRTK = nh.subscribe<bdxt::rtk>("/RTK",5,&TransformFusion::rtkHandler, this);
         pubENU = nh.advertise<nav_msgs::Odometry>("/ENU",5);
 
         laserOdometry2.header.frame_id = "/camera_init";
@@ -90,7 +93,7 @@ public:
         camera_2_base_link_Trans.child_frame_id_ = "/base_link";
 
         is_gps_init = false;
-        tBody2ENU = Eigen::Isometry3d::Identity();
+        tBody_in_ENU = Eigen::Isometry3d::Identity();
 
         for (int i = 0; i < 6; ++i)
         {
@@ -235,26 +238,31 @@ public:
         //    和ros标准保持一致，默认将前进方向设置为x，向上为z
         // 2. 车体系 --> 东北天：坐标变换，利用第一帧的xyzrpy变换得到。
         // ************************************************************************************************
-        Eigen::Isometry3d mLidar = Eigen::Isometry3d::Identity(); // 将当前的位姿赋值给mBody
-        mLidar.rotate(Eigen::Quaterniond(
-                            laserOdometry2.pose.pose.orientation.x,
-                        laserOdometry2.pose.pose.orientation.y,
-                    laserOdometry2.pose.pose.orientation.z,
-                laserOdometry2.pose.pose.orientation.w
-        ));
+        if(!is_gps_init){
+            ROS_INFO("gps_not_init!");
+            return;
+        }
+
+        Eigen::Isometry3d mLidar = Eigen::Isometry3d::Identity(); // 将当前的位姿赋值给mLidar
         mLidar.translate(Eigen::Vector3d(
-                            laserOdometry2.pose.pose.position.x, // 直接将激光剪掉
+                            laserOdometry2.pose.pose.position.x,
                         laserOdometry2.pose.pose.position.y,
                     laserOdometry2.pose.pose.position.z
         ));
+        mLidar.rotate(Eigen::Quaterniond(
+                            laserOdometry2.pose.pose.orientation.z,
+                        -laserOdometry2.pose.pose.orientation.x,
+                    -laserOdometry2.pose.pose.orientation.y,
+                laserOdometry2.pose.pose.orientation.w
+        ));
 
         // 1. mLidar --> mBody
-        Eigen::Isometry3d tLidar2Body = Eigen::Isometry3d::Identity();
-        tLidar2Body.translate(Eigen::Vector3d(1.83,0,0));
-        Eigen::Isometry3d mBody = tLidar2Body*mLidar;
+        Eigen::Isometry3d tLidar_in_Body = Eigen::Isometry3d::Identity();
+        tLidar_in_Body.translate(Eigen::Vector3d(1.83,0,0));
+        Eigen::Isometry3d mBody = tLidar_in_Body*mLidar;
 
         // 2. mBody --> ENU
-        Eigen::Isometry3d mENU = tBody2ENU*mBody;
+        Eigen::Isometry3d mENU = tBody_in_ENU*mBody;
 
         // 3. 发布当前的ENU坐标
         Eigen::Vector3d vEulerENU_ = mENU.rotation().eulerAngles(2,1,0);
@@ -265,52 +273,51 @@ public:
         msgENU.pose.pose.position.x = vPoseENU_.x();
         msgENU.pose.pose.position.y = vPoseENU_.y();
         msgENU.pose.pose.position.z = vPoseENU_.z();
-        msgENU.pose.pose.orientation.x = qEulerENU_.x();
-        msgENU.pose.pose.orientation.y = qEulerENU_.y();
-        msgENU.pose.pose.orientation.z = qEulerENU_.z();
+        msgENU.pose.pose.orientation.x = -qEulerENU_.y();
+        msgENU.pose.pose.orientation.y = -qEulerENU_.z();
+        msgENU.pose.pose.orientation.z = qEulerENU_.x();
         msgENU.pose.pose.orientation.w = qEulerENU_.w();
         pubENU.publish(msgENU);
     }
 
-    // 涉及到三个坐标系：gps,body,lidar
-    // body和lidar差一个平移
     void rtkHandler(const bdxt::rtk::ConstPtr& RTK)
     {
         if(!is_gps_init){ // gps初始值记录
             if(RTK->navStatus == 4 && RTK->rtkStatus == 5){
                 // qBody2ENU计算车体坐标系到gps(东北天)坐标系的旋转
                 // 而可以获取的imu读数是惯导系下的值(北东地)，因此需要作变换：BODY-->北东地-->东北天
-                // 涉及两个四元数：qBODY2NED,qNED2ENU
-
-                Eigen::Vector3d vBody2ENU; // gps初始化位姿：x,y,z,pitch,yaw,roll，同时也是激光原点坐标系和大地坐标系的静态变换
-                Eigen::Quaterniond qBody2ENU; // body到ENU的旋转变换
+                // 涉及两个四元数：qBODY_in_NED,qNED_in_ENU
+                Eigen::Vector3d vBody_in_ENU; // gps初始化位姿：x,y,z,pitch,yaw,roll，同时也是激光原点坐标系和大地坐标系的静态变换
+                Eigen::Quaterniond qBody_in_ENU; // body到ENU的旋转变换
 
                 // RTK的RPY测量的是车体相对于ENU坐标系的旋转
-                Eigen::Quaterniond qBodyNED_; // Body相对于NED坐标系下的旋转，实际上是NED2BODY
-                qBodyNED_ = Eigen::AngleAxisd(RTK->yaw*PI/180.0,Eigen::Vector3d::UnitZ())*
+                // x_in_y这里表示的是，x坐标系在y坐标系下的表示，也就是y坐标系到x坐标系的变换
+                Eigen::Quaterniond qBody_in_NED;
+                qBody_in_NED = Eigen::AngleAxisd(RTK->yaw*PI/180.0,Eigen::Vector3d::UnitZ())*
                             Eigen::AngleAxisd(RTK->pitch*PI/180.0,Eigen::Vector3d::UnitY())*
                             Eigen::AngleAxisd(RTK->roll*PI/180.0,Eigen::Vector3d::UnitX());
-                Eigen::Quaterniond qBody2NED = qBodyNED_.conjugate();
-                // 东北天 --> 北东地，先z轴旋转PI/2，再x轴旋转PI，注意顺序
-                Eigen::Quaterniond qNED2ENU;
-                qNED2ENU = Eigen::AngleAxisd(PI/2,Eigen::Vector3d::UnitZ())*
+                // 北东地变换到东北天，先z轴旋转PI/2，再x轴旋转PI，注意顺序
+                Eigen::Quaterniond qENU_in_NED; // 其实是NED坐标系转ENU坐标系
+                qENU_in_NED = Eigen::AngleAxisd(PI/2,Eigen::Vector3d::UnitZ())*
                         Eigen::AngleAxisd(PI,Eigen::Vector3d::UnitX());
-                //注意顺序，从右到左变换
-                qBody2ENU = qNED2ENU*qBody2NED;
+                // 我们要用东北天到北东地，因此取反
+                qBody_in_ENU = qENU_in_NED.conjugate()*qBody_in_NED;
                 
-                // Body到ENU原点，因此是负数
-                vBody2ENU[0] = -RTK->x;  // 如果使用第一帧为坐标原点坐标转换，设置为0
-                vBody2ENU[1] = -RTK->y;  // 如果使用第一帧为坐标原点坐标转换，设置为0
-                vBody2ENU[2] = -RTK->Ati;  // 如果使用第一帧为坐标原点坐标转换，设置为0
+                // Body坐标系在ENU坐标系下的位置，直接读gps转换函数的读数
+                vBody_in_ENU[0] = RTK->x;  // 如果使用第一帧为坐标原点坐标转换，设置为0
+                vBody_in_ENU[1] = RTK->y;  // 如果使用第一帧为坐标原点坐标转换，设置为0
+                vBody_in_ENU[2] = RTK->Ati;  // 如果使用第一帧为坐标原点坐标转换，设置为0
 
-                // 得到变换矩阵
-                tBody2ENU.rotate(qBody2ENU);
-                tBody2ENU.translate(vBody2ENU);
+                // 得到变换矩阵，先按ENU坐标轴平移，再旋转
+                tBody_in_ENU.translate(vBody_in_ENU);
+                tBody_in_ENU.rotate(qBody_in_ENU);
 
+                std::cout<<tBody_in_ENU.matrix()<<std::endl;
+                ROS_INFO("gps init successfully!\n");
                 is_gps_init = true;
             }
             else{
-                ROS_INFO("bad RTK status\n");
+                ROS_INFO("bad RTK status!\n");
             }
         }
         // TODO: 注意激光的时间戳不在这里，时间戳判断无法进行，这部分功能需要放到imageProjection.cpp中
