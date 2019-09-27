@@ -68,7 +68,7 @@ private:
     std_msgs::Header currentHeader;
 
     bool is_gps_init; 
-    Eigen::Isometry3d tBody_in_ENU;
+    Eigen::Isometry3d tBodyInit_in_ENU;
 
 public:
 
@@ -93,7 +93,7 @@ public:
         camera_2_base_link_Trans.child_frame_id_ = "/base_link";
 
         is_gps_init = false;
-        tBody_in_ENU = Eigen::Isometry3d::Identity();
+        tBodyInit_in_ENU = Eigen::Isometry3d::Identity();
 
         for (int i = 0; i < 6; ++i)
         {
@@ -232,10 +232,10 @@ public:
         tfBroadcaster2.sendTransform(laserOdometryTrans2);
 
         // *********************************    激光里程计 --> 全局位姿    ***********************************
-        // 0. 北斗星通的惯导系为北东地，大地坐标转换函数的坐标系为东北天，这里现将惯导系作处理，转为东北天
-        //    将大地坐标的xyz和惯导输出的rpy统一到东北天坐标系下。
-        // 1. 激光系 --> 车体系：一个平移，不考虑惯导安装，因为可以直接从第一帧的RTK消息中，得知第一帧的车体系到东北天坐标系下的变换
-        //    和ros标准保持一致，默认将前进方向设置为x，向上为z
+        // 0. 激光里程计是当前激光传感器相对于激光第一帧的变换，但是我们要的是当前车体相对于车体第一帧的变换，这样才能得到车体在东北天
+        //    坐标系下的位姿。
+        // 1. 激光 --> 车体系：利用激光到激光第一帧和激光第一帧到车体第一帧的关系求得。
+        // 2. 车体 --> 车体系：利用激光到车体第一帧和激光到车体的关系得到。
         // 2. 车体系 --> 东北天：坐标变换，利用第一帧的xyzrpy变换得到。
         // ************************************************************************************************
         if(!is_gps_init){
@@ -243,26 +243,31 @@ public:
             return;
         }
 
-        Eigen::Isometry3d mLidar = Eigen::Isometry3d::Identity(); // 将当前的位姿赋值给mLidar
-        mLidar.translate(Eigen::Vector3d(
+        Eigen::Isometry3d tLidar_in_LidarInit = Eigen::Isometry3d::Identity(); // 将当前的位姿赋值给mLidar
+        tLidar_in_LidarInit.translate(Eigen::Vector3d(
                             laserOdometry2.pose.pose.position.x,
                         laserOdometry2.pose.pose.position.y,
                     laserOdometry2.pose.pose.position.z
         ));
-        mLidar.rotate(Eigen::Quaterniond(
+        tLidar_in_LidarInit.rotate(Eigen::Quaterniond(
                             laserOdometry2.pose.pose.orientation.z,
                         -laserOdometry2.pose.pose.orientation.x,
                     -laserOdometry2.pose.pose.orientation.y,
                 laserOdometry2.pose.pose.orientation.w
         ));
 
-        // 1. mLidar --> mBody
-        Eigen::Isometry3d tLidar_in_Body = Eigen::Isometry3d::Identity();
-        tLidar_in_Body.translate(Eigen::Vector3d(1.83,0,0));
-        Eigen::Isometry3d mBody = tLidar_in_Body*mLidar;
+        // 1. mLidar --> mBodyInit
+        Eigen::Isometry3d tLidarInit_in_BodyInit = Eigen::Isometry3d::Identity();
+        tLidarInit_in_BodyInit.translate(Eigen::Vector3d(1.83,0,0));
+        Eigen::Isometry3d tLidar_in_BodyInit = tLidarInit_in_BodyInit*tLidar_in_LidarInit;
 
-        // 2. mBody --> ENU
-        Eigen::Isometry3d mENU = tBody_in_ENU*mBody;
+        // 2. mBody --> mBodyInit
+        Eigen::Isometry3d tBody_in_Lidar = Eigen::Isometry3d::Identity();
+        tBody_in_Lidar.translate(Eigen::Vector3d(-1.83,0,0));
+        Eigen::Isometry3d tBody_in_BodyInit = tLidar_in_BodyInit*tBody_in_Lidar;
+
+        // 3. mBody --> ENU
+        Eigen::Isometry3d mENU = tBodyInit_in_ENU*tBody_in_BodyInit;
 
         // 3. 发布当前的ENU坐标
         Eigen::Vector3d vEulerENU_ = mENU.rotation().eulerAngles(2,1,0);
@@ -309,10 +314,10 @@ public:
                 vBody_in_ENU[2] = RTK->Ati;  // 如果使用第一帧为坐标原点坐标转换，设置为0
 
                 // 得到变换矩阵，先按ENU坐标轴平移，再旋转
-                tBody_in_ENU.translate(vBody_in_ENU);
-                tBody_in_ENU.rotate(qBody_in_ENU);
+                tBodyInit_in_ENU.translate(vBody_in_ENU);
+                tBodyInit_in_ENU.rotate(qBody_in_ENU);
 
-                std::cout<<tBody_in_ENU.matrix()<<std::endl;
+                std::cout<<tBodyInit_in_ENU.matrix()<<std::endl;
                 ROS_INFO("gps init successfully!\n");
                 is_gps_init = true;
             }
